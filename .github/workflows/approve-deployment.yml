@@ -1,0 +1,122 @@
+name: Approve Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to approve"
+        required: false
+        default: "production"
+        type: string
+      comment:
+        description: "Approval comment"
+        required: false
+        default: "Approved by GitHub App bot"
+        type: string
+      max_attempts:
+        description: "Maximum number of poll attempts before giving up"
+        required: false
+        default: "40"
+        type: string
+      poll_interval:
+        description: "Seconds to wait between poll attempts"
+        required: false
+        default: "15"
+        type: string
+
+jobs:
+  approve:
+    name: Poll and Approve via GitHub App
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+
+      - name: Poll and approve pending deployments
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          COMMENT: ${{ inputs.comment }}
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          POLL_INTERVAL: ${{ inputs.poll_interval }}
+        run: |
+          # Stop after this many consecutive polls with no pending deployments.
+          # At 15s intervals, 5 consecutive empty polls = 75s quiet window.
+          MAX_CONSECUTIVE_EMPTY=5
+
+          TOTAL_APPROVED=0
+          CONSECUTIVE_EMPTY=0
+
+          for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
+            echo "--- Poll attempt $ATTEMPT/$MAX_ATTEMPTS ---"
+
+            # List all workflow runs currently waiting for a deployment review.
+            WAITING_RUNS=$(gh api \
+              "/repos/$REPO/actions/runs?status=waiting&per_page=50" \
+              --jq '[.workflow_runs[].id]')
+
+            RUN_COUNT=$(echo "$WAITING_RUNS" | jq 'length')
+            echo "Waiting runs: $RUN_COUNT"
+
+            ATTEMPT_APPROVED=0
+
+            for RUN_ID in $(echo "$WAITING_RUNS" | jq -r '.[]'); do
+              # Find pending deployments for the target environment in this run.
+              ENV_IDS=$(gh api \
+                "/repos/$REPO/actions/runs/$RUN_ID/pending_deployments" \
+                --jq "[.[] | select(.environment.name == \"$ENVIRONMENT\") | .environment.id]")
+
+              if [ "$ENV_IDS" = "[]" ] || [ -z "$ENV_IDS" ]; then
+                continue
+              fi
+
+              echo "Approving run $RUN_ID (env IDs: $ENV_IDS)..."
+
+              gh api \
+                --method POST \
+                "/repos/$REPO/actions/runs/$RUN_ID/pending_deployments" \
+                --input - <<EOF
+          {
+            "environment_ids": $ENV_IDS,
+            "state": "approved",
+            "comment": "$COMMENT"
+          }
+          EOF
+
+              echo "Approved run $RUN_ID."
+              ATTEMPT_APPROVED=$((ATTEMPT_APPROVED + 1))
+              TOTAL_APPROVED=$((TOTAL_APPROVED + 1))
+            done
+
+            if [ "$ATTEMPT_APPROVED" -eq 0 ]; then
+              CONSECUTIVE_EMPTY=$((CONSECUTIVE_EMPTY + 1))
+              echo "No pending deployments (consecutive empty: $CONSECUTIVE_EMPTY/$MAX_CONSECUTIVE_EMPTY)"
+              if [ "$CONSECUTIVE_EMPTY" -ge "$MAX_CONSECUTIVE_EMPTY" ]; then
+                echo "Stopping: $MAX_CONSECUTIVE_EMPTY consecutive empty polls with no pending deployments."
+                break
+              fi
+            else
+              # Reset the empty counter whenever we approve something, since
+              # the next stage may not be pending yet.
+              CONSECUTIVE_EMPTY=0
+            fi
+
+            if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+              echo "Waiting ${POLL_INTERVAL}s..."
+              sleep "$POLL_INTERVAL"
+            fi
+          done
+
+          echo ""
+          echo "=== Summary ==="
+          echo "Total deployments approved: $TOTAL_APPROVED"
+
+          if [ "$TOTAL_APPROVED" -eq 0 ]; then
+            echo "Warning: no deployments were approved during this run."
+            exit 1
+          fi
